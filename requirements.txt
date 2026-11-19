@@ -1,0 +1,13 @@
+# Silverside Comfy Nodes: everything the parts need that ComfyUI itself doesn't ship.
+# Left to ComfyUI and the build on purpose:
+#   torch, torchvision, numpy  ComfyUI ships them; listing them can make pip replace the build's CUDA torch
+#   opencv (cv2)               every build already has it from other packs, in several variants; adding another
+#                              variant is what breaks OpenCV installs. Parts that use cv2 say so clearly if it's missing.
+Pillow>=10.1
+av
+diffusers>=0.32
+einops
+matplotlib
+moderngl
+scipy
+trimesh

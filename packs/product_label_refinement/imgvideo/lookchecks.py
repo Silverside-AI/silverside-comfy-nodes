@@ -1,0 +1,730 @@
+"""The look checks: the user's notes from the first real run's review rounds (2026-10-17), read off the delivered frames,
+with pass/fail flags and the setting an agent tries next (summary["actions"]). Ported from that run's job scripts
+(check_swim.py, check_level.py, check_sharp.py, check_body.py, check_ghost.py, check_spots.py), same measures.
+
+  swim    the label slides against the product on near-still frames (the user: "it looks like it's fluid and lives
+          its own life"). Per pair of frames, the shift of the body (the matte without the label) and of the label
+          (the changed pixels), each the best whole-region match of high-passed luminance (masked SSD, sub-pixel by a
+          parabola); swim = |label - body|. The source's own print is read the same way on the same region: the
+          label may swim as much as the garbled print did, not more. Near-still pairs only (the body moves at most
+          still_px): on fast moves the measure is blur, not glue.
+  ends    the same on the first and last pairs of a run the label holds: the glue's smoothing at a run's ends (edge
+          "line" extrapolates the next frames' trend, "mean" doesn't; "mean" helped one product and hurt another).
+  lock    (the edit carry on a body printed all over, V77) the new print drifting against the generated print it
+          replaces: per pair, the new letters' motion less the garbled ones' (Lucas-Kanade on the changed px only),
+          summed over each run, its spread within lock_frames frames over lock_px (the user: "the text on the
+          shoulder drifts a bit while the hand moves out of screen").
+  creep   the label creeping on a still product (V71; the user: "the label drifts slightly" over 3-4 frames of a still
+          shot, 0.05-0.15 px a frame, 0.6 px in all): the label's shift less the source print's on the label's box, each by phase
+          correlation (the swim's own search wanders 0.02-0.05 px a pair),
+          summed over each run of still pairs (the body moves at most creep_still px), its spread over creep_px.
+          Pairs where the fix's strength changes (an ease in or out, a fade at a run's end: the print changes, it
+          doesn't move) don't count.
+  level   the label's lines against the product's base, both straightened on the body's axis (level.measure: skew by
+          point projection, 1 px profile smoothing; bowed lines at the axis, V61). Against 0 where render.level
+          levelled to the base, else against the keyframe frame's own level. Only where the base holds steady
+          (base_mad_max), as render.level.
+  lines   the label's lines against the frame's own print, the same measure on both on the same straightening, off
+          their difference on the keyframe's frame (the one workflow's jar: a 0.5-0.75 deg turn on 140-163 that
+          level's 1 deg doesn't reach, V61). Judged where the frame's print holds level with the base as on the
+          keyframe's frame (lines_print_deg): where the generator slants its print (V45) the label follows the body,
+          and level judges it.
+  sharp   the print's edge strength against the keyframe frame's (the user: "the label gets too blurry at some
+          points"), under sharp_floor and softer than the source's own print there by sharp_margin (a source that is
+          soft too gets matching motion blur on purpose).
+  tilt    the print's side edge against the product's limb (the vertical wordmark, if there is one), in the body's own
+          frame, against the median over the keyframe's frame and ref_window frames each side: turned (deg) or
+          shifted (px).
+  ghost   on frames with the sparkle re-add (render.sparkles as a list of frames, whole-band compositing): the garbled
+          print coming back through it (V37), the re-add render against one without it, measured in the render
+          (render.json ghost_px). Print-only compositing keeps the re-add off: nothing to measure there (on an approved
+          print-only render the same measure counts only the source's glitter, 45-250 px a frame).
+  spots   small marks a print-only composite leaves: changed pixels darker than the source's own body by spot_levels,
+          clear of the output's print by spot_clear px (letter fringes are not spots), in pieces under spot_max_px.
+          Light print only: dark print's own letters are dark marks it can't tell from spots.
+  double  the source's own print beside the label's (review.doubled, V54): where the label lets the source through
+          over print (its end fade, a band that ends on a line), the generator's line, drifting against the tracked
+          label, shows a few px off the label's own (the one workflow's jar: its second-last line doubled
+          away from the keyframe). double_px or more, as a 5-frame median. Ink only: a round body's soft limb
+          band passes the rest of the test next to the label's letters (V55).
+"""
+import math
+
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.ndimage import binary_dilation, binary_erosion, gaussian_filter, grey_opening, median_filter
+
+from . import level as lvl
+from .glue import edges
+from .printalpha import edge_strength, lin_lum
+
+LOOKS = {
+    "still_px": 3.0,         # px: a pair is near-still when the body moves at most this far
+    "swim_search": 8,        # px: the shift search around the matte centroids' shift
+    "swim_excess": 0.35,     # px: the label's swim over the source print's on a near-still pair
+    "swim_pairs": 2,         # ... on this many pairs within swim_window pairs: flagged
+    "swim_window": 6,
+    "ends_frames": 4,        # the pairs within this many frames of a held run's first and last frames: "ends"
+    "creep_still": 0.2,      # px: a pair is still when the source print moves at most this far (on the label's box;
+                             # still frames 0.00-0.03, a bottle's last settling step 0.36: not still) ...
+    "lock_px": 0.6,          # px: the new print against the kept print round it, its summed drift spread within ...
+    "lock_frames": 12,       # ... this many frames (edit carry, V77: the spray clip without the print lock 0.81-1.32 px on 5 lines, with it 0.37-0.48)
+    "lock_reach": 4,         # px: a line's centre off where the print's motion puts it (the same line)
+    "creep_px": 0.3,         # ... and the label's summed shift against it over a run of still pairs spreads over this
+                             # (v11's pump bottle 0.59 px, the user saw it; 0.03 on the motion clock, V71) ...
+    "creep_pairs": 3,        # ... over at least this many pairs in a row
+    "creep_fix": 0.15,       # a pair whose fix strength (mean |output - source| on the label) changes by this share
+                             # is an ease or a fade, not a move: left out
+    "level_deg": 1.0,        # deg: the lines off the base (or the keyframe's level), 5-frame median ...
+    "level_run_s": 0.25,     # ... held this long
+    "lines_deg": 0.3,        # deg: the label's lines turned against the frame's own print beyond their keyframe frame's
+    "lines_px": 3.0,         # difference, and by this many px end to end across the copy block (a small label's block
+                             # reads 0.8 deg a px), 5-frame median, held level_run_s (the jar on 0.8.0: 0.65 deg, 5.4
+                             # px; fixed: under 0.2 deg; an approved bottle with small white print: 1.75 deg, 2.3 px)
+    "lines_print_deg": 0.5,  # deg: the frame's print off the base by this much more than on the keyframe's frame: not
+                             # judged there (the generator slanting its print, V45)
+    "base_mad_max": 0.5,     # deg: the straightened base's frame-to-frame scatter above this: level not judged
+    "base_jump_deg": 1.5,    # deg: a frame's base this far off its 15-frame running median (a sparkle trail splitting
+                             # the matte read 21 deg) isn't judged
+    "sharp_floor": 0.7,      # the print's edge strength under this share of the keyframe frame's ...
+    "sharp_margin": 0.1,     # ... and under the source's own share there less this
+    "tilt_deg": 1.0,         # deg: the print's side edge turned against the limb (5-frame median) ...
+    "side_px": 4.0,          # ... or shifted (px, at the body's scale), on frames whose print is crisp (sharp_floor):
+                             # a gross check. Read off a print-only composite it scatters (approved renders: p90
+                             # 0.6 deg, 2 px); the body check (V39, through the mappings) is the fine one
+    "tilt_run_s": 0.25,      # ... held this long
+    "ref_window": 3,         # frames each side of the keyframe's: the tilt reference
+    "ghost_px": 60,          # old print px the re-add brings back on a frame (it brought 33-330; real specks 6-41)
+    "spot_levels": 12.0,     # levels darker than the source's body ...
+    "spot_max_px": 60,       # ... in pieces at most this big ...
+    "spot_clear": 4,         # ... this far from the output's print (dilation, px): a letter's fringe isn't a spot
+    "spot_min_px": 4,        # ... and at least this big
+    "spot_body": 15,         # px: the grey opening of the source that gives its body under the garbled print
+    "double_px": 150,        # px of the source's own print beside the label's (review.doubled), 5-frame median: the
+                             # one workflow's jar v1 read 426-639 a frame, fixed 0-88
+}
+
+
+# ---------------------------------------------------------------------------------------------------------- swim
+
+def _hp(x):
+    return gaussian_filter(x, 1.0) - gaussian_filter(x, 6.0)
+
+
+def shift(a, b, m, mx, c=(0, 0)):
+    """The (dx, dy) that best maps a onto b (b(p + d) ~ a(p)) over mask m: masked SSD over integer shifts within mx of
+    c, then a parabola through the minimum's neighbours. -> (shift, on the search's edge) or None"""
+    ys, xs = np.nonzero(m)
+    if len(ys) < 50:
+        return None
+    va = a[ys, xs]
+    H, W = b.shape
+    E = np.full((2 * mx + 1, 2 * mx + 1), np.inf)
+    cx, cy = int(round(c[0])), int(round(c[1]))
+    for dy in range(-mx, mx + 1):
+        yy = ys + dy + cy
+        okY = (yy >= 0) & (yy < H)
+        for dx in range(-mx, mx + 1):
+            xx = xs + dx + cx
+            ok = okY & (xx >= 0) & (xx < W)
+            if ok.sum() > 0.8 * len(ys):
+                E[dy + mx, dx + mx] = np.mean((b[yy[ok], xx[ok]] - va[ok]) ** 2)
+    if not np.isfinite(E).any():
+        return None
+    iy, ix = np.unravel_index(np.argmin(E), E.shape)
+
+    def par(e0, e1, e2):
+        d = e0 - 2 * e1 + e2
+        return 0.0 if not np.isfinite(d) or d <= 0 else 0.5 * (e0 - e2) / d
+    fx = par(E[iy, ix - 1], E[iy, ix], E[iy, ix + 1]) if 0 < ix < 2 * mx else 0.0
+    fy = par(E[iy - 1, ix], E[iy, ix], E[iy + 1, ix]) if 0 < iy < 2 * mx else 0.0
+    edge = ix in (0, 2 * mx) or iy in (0, 2 * mx)
+    return np.array([ix - mx + fx + cx, iy - mx + fy + cy]), edge
+
+
+def _pc(a, b):
+    """The shift (dx, dy) that maps a onto b by phase correlation (Hann window, a parabola through the peak): exact to
+    a few hundredths of a px on still frames, where the swim's integer search plus parabola wanders 0.02-0.05 px a
+    pair (summed over a still run, a glittery tube read 0.3 px of creep that wasn't there, V71)."""
+    a = a - a.mean()
+    b = b - b.mean()
+    w = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1]))
+    Fa, Fb = np.fft.fft2(a * w), np.fft.fft2(b * w)
+    X = Fa * np.conj(Fb)
+    r = np.real(np.fft.ifft2(X / (np.abs(X) + 1e-9)))
+    y, x = np.unravel_index(int(r.argmax()), r.shape)
+    H, W = r.shape
+
+    def sub(c, m, p):
+        d = m - 2 * c + p
+        return 0.0 if d == 0 else (m - p) / (2 * d)
+    yy = y + sub(r[y, x], r[(y - 1) % H, x], r[(y + 1) % H, x])
+    xx = x + sub(r[y, x], r[y, (x - 1) % W], r[y, (x + 1) % W])
+    if yy > H / 2:
+        yy -= H
+    if xx > W / 2:
+        xx -= W
+    return np.array([-xx, -yy])
+
+
+def _lk(a, b, m, d0, steps=5, fit=False):
+    """The shift d with b(x) ~ a(x) moved by d (times a gain, plus an offset), over the px in m (Lucas-Kanade on
+    high-passed luminance, from d0, in
+    content moving by +d from a to b). No window edges: a static mask can't pull it to zero. -> d or None (too little texture)"""
+    from scipy.ndimage import shift as nd_shift
+    if m.sum() < 200:
+        return None
+    a, b = _hp(a) * 255.0, _hp(b) * 255.0
+    d = np.asarray(d0, float).copy()
+    for _ in range(steps):
+        ad = nd_shift(a, (d[1], d[0]), order=1, mode="nearest")
+        gy, gx = np.gradient(ad)
+        # with a gain and an offset (a light blinking over the print isn't motion)
+        G = np.c_[gx[m], gy[m], ad[m], np.ones(int(m.sum()))]
+        M = G.T @ G
+        if np.linalg.cond(M[:2, :2]) > 1e4 or np.linalg.cond(M) > 1e8:
+            return None
+        step = -np.linalg.solve(M, G.T @ (b[m] - ad[m]))[:2]
+        d = d + step
+        if np.hypot(*step) < 1e-3:
+            break
+    if not np.isfinite(d).all():
+        return None
+    if fit:                      # how well b is a moved: its correlation with a shifted by d, over m
+        ad = nd_shift(a, (d[1], d[0]), order=1, mode="nearest")
+        return d, float(np.corrcoef(ad[m], b[m])[0, 1])
+    return d
+
+
+def lock_pair(s0, s1, o0, o1, region=None, min_px=150, pad=10, levels=12.0, ring=20, fit_min=0.85, min_print=0.05):
+    """lock (the edit carry, V77): per edited line (the px the clip changed by `levels` or more, grown 3 px, a component
+    of min_px or more; the soft rim of the carry joins every line into one region), the new letters' motion less the
+    generated print's round them: a `ring` px band round the line, off the changed px, where the output is the source
+    (kept graphics, body, rays). Each by Lucas-Kanade on the output (from the source's phase correlation on the box),
+    per line: the whole label's motion hid a shoulder line drifting 0.3 px (0.02 over all lines). Against the garbled
+    letters instead, the generator's redraw of small type read 0.3-0.46 px within 12 still frames. Pairs where the
+    ring isn't the same print moved (correlation under fit_min: a fast move, the generator redrawing) are skipped, and
+    lines whose ring holds under min_print print (a plain body: a coloured pump's 0.007 read its sliding print as
+    drift; the spray's rings 0.13-0.98).
+    Measured on moving frames too: the drift came while a hand left. -> [[cx, cy, dx, dy, mx, my], ...] (the line's
+    centre, its drift, the print's motion) or None"""
+    changed = np.abs(o0.astype(np.int16) - s0.astype(np.int16)).max(-1) >= levels
+    near = binary_dilation(np.abs(o0.astype(np.int16) - s0.astype(np.int16)).max(-1) > 0, iterations=3)
+    comp, n = ndi.label(binary_dilation(changed, iterations=3), np.ones((3, 3)))
+    out = []
+    for i, sl in enumerate(ndi.find_objects(comp), start=1):
+        if sl is None:
+            continue
+        y0, y1 = max(sl[0].start - ring - pad, 0), min(sl[0].stop + ring + pad, changed.shape[0])
+        x0, x1 = max(sl[1].start - ring - pad, 0), min(sl[1].stop + ring + pad, changed.shape[1])
+        w = (slice(y0, y1), slice(x0, x1))
+        c_ = comp[w] == i
+        if c_.sum() < min_px or min(c_.shape) < 16:
+            continue
+        line = binary_dilation(changed[w] & c_, iterations=2)
+        rg = binary_dilation(c_, iterations=ring) & ~near[w]
+        from .printalpha import print_share
+        if print_share(o0[w], rg) < min_print:
+            continue                         # a plain body round the line: no print to measure against
+        lo0, lo1 = lin_lum(o0[w]), lin_lum(o1[w])
+        d0 = _pc(lin_lum(s0[w]), lin_lum(s1[w]))
+        a_, b_ = _lk(lo0, lo1, rg, d0, fit=True), _lk(lo0, lo1, line, d0)
+        if a_ is None or b_ is None or a_[1] < fit_min:
+            continue
+        a_ = a_[0]
+        if np.hypot(*(b_ - a_)) > 3.0:
+            continue
+        cy, cx = np.argwhere(c_).mean(0)
+        out.append([round(float(cx + x0), 1), round(float(cy + y0), 1)] + [round(float(v), 3) for v in (b_ - a_)] +
+                   [round(float(v), 3) for v in a_])
+    return out or None
+
+
+def swim_pair(s0, s1, o0, o1, m0, m1, region, still_px=3.0, mx=8):
+    """One pair of frames: the body's shift (source), and the label's against it in the output and in the source on the
+    same region (the output's changed pixels on the first frame). -> {"body": [dx, dy], "swim_px", "swim_src_px"}, or
+    None (too little to match, or the body moves more than still_px)"""
+    ys, xs = np.nonzero(m0 | m1)
+    if not len(ys):
+        return None
+    y0, y1 = max(ys.min() - 20, 0), min(ys.max() + 21, m0.shape[0])
+    x0, x1 = max(xs.min() - 20, 0), min(xs.max() + 21, m0.shape[1])
+    sl = (slice(y0, y1), slice(x0, x1))
+    c0 = np.array(np.nonzero(m0[sl]))[::-1].mean(1)
+    c1 = np.array(np.nonzero(m1[sl]))[::-1].mean(1)
+    cs = c1 - c0
+    R = region[sl]
+    body = binary_dilation(m0[sl], iterations=3) & ~binary_dilation(R, iterations=8)
+    lab = binary_dilation(R, iterations=2) & m0[sl]
+    A, B = _hp(lin_lum(s0[sl])), _hp(lin_lum(s1[sl]))
+    db = shift(A, B, body, mx, cs)
+    if db is None or db[1] or np.hypot(*db[0]) > still_px:
+        return None
+    ds = shift(A, B, lab, mx, cs)
+    Ao, Bo = _hp(lin_lum(o0[sl])), _hp(lin_lum(o1[sl]))
+    # the output's body is the source's outside the label (only the label changes): the same body shift
+    do = shift(Ao, Bo, lab, mx, cs)
+    if ds is None or do is None:
+        return None
+    # the fix's strength on both frames (an ease or a fade changes it: the creep check leaves those pairs out)
+    f0 = float(np.abs(o0[sl].astype(np.float32) - s0[sl].astype(np.float32)).max(-1)[lab].mean()) if lab.any() else 0.0
+    f1 = float(np.abs(o1[sl].astype(np.float32) - s1[sl].astype(np.float32)).max(-1)[lab].mean()) if lab.any() else 0.0
+    # creep's measure: the label's box (the output's changed px, 6 px round) in the output against the same box in the
+    # source, each by phase correlation on luminance: the label's own shift less the source print's
+    box = binary_dilation(R, iterations=6)
+    ys_, xs_ = np.nonzero(box)
+    bs = (slice(ys_.min(), ys_.max() + 1), slice(xs_.min(), xs_.max() + 1))
+    ls0, ls1 = lin_lum(s0[sl])[bs], lin_lum(s1[sl])[bs]
+    lo0, lo1 = lin_lum(o0[sl])[bs], lin_lum(o1[sl])[bs]
+    if min(ls0.shape) >= 16:
+        sp = _pc(ls0, ls1)
+        dc = _pc(lo0, lo1) - sp
+    else:
+        sp, dc = ds[0], do[0] - ds[0]
+    return {"body": [round(float(v), 2) for v in db[0]], "swim_px": round(float(np.hypot(*(do[0] - db[0]))), 2),
+            "swim_src_px": round(float(np.hypot(*(ds[0] - db[0]))), 2),
+            "d": [round(float(v), 3) for v in dc], "src": [round(float(v), 3) for v in sp],
+            "fix": [round(f0, 2), round(f1, 2)]}
+
+
+# ---------------------------------------------------------------------------------------------------------- tilt
+
+def tilt_measure(frame, M, rim=6, step=4.0):
+    """check_body.py's measure: the print's left edge (its leftmost stroke per 4 px step along the axis) against the
+    body's left limb, in the body's frame. -> {"tilt_deg", "side_px", "top_px", "bot_px", "body_px", "axis_deg"} or
+    None"""
+    ys, xs = np.nonzero(M)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    L = lin_lum(frame[y0:y1, x0:x1])
+    Mi = binary_erosion(M[y0:y1, x0:x1], iterations=rim)
+    ink = ((L - grey_opening(L, size=(15, 15))) > 0.03) & Mi
+    iy, ix = np.nonzero(ink)
+    if len(iy) < 200:
+        return None
+    rows = np.arange(np.percentile(iy, 2), np.percentile(iy, 98)).astype(int)
+    m = M[y0:y1, x0:x1]
+    mids, ok = [], []
+    for r in rows:
+        c = np.nonzero(m[r])[0]
+        if len(c) > 10:
+            mids.append(0.5 * (c.min() + c.max()))
+            ok.append(r)
+    if len(ok) < 4:
+        return None
+    a, b = np.polyfit(ok, mids, 1)
+    th = np.arctan(a)
+    d = np.array([np.sin(th), np.cos(th)])
+    n = np.array([np.cos(th), -np.sin(th)])
+    c0 = np.array([b, 0.0])
+    my, mx_ = np.nonzero(m)
+    P = np.stack([mx_, my], 1) - c0
+    Q = np.stack([ix, iy], 1) - c0
+    ma, mc = P @ d, P @ n
+    qa, qc = Q @ d, Q @ n
+    lim, lft, at = [], [], []
+    for lo in np.arange(qa.min(), qa.max(), step):
+        s = (qa >= lo) & (qa < lo + step)
+        sm = (ma >= lo) & (ma < lo + step)
+        if s.sum() >= 2 and sm.sum() >= 2:
+            lim.append(mc[sm].min())
+            lft.append(qc[s].min())
+            at.append(lo + step / 2)
+    if len(at) < 8:
+        return None
+    lim, lft, at = map(np.array, (lim, lft, at))
+    gap = lft - lim
+    col = gap < np.percentile(gap, 50) + 6
+    if col.sum() < 8:
+        return None
+    k, c = np.polyfit(at[col], gap[col], 1)
+    r = gap[col] - (k * at[col] + c)
+    keep = np.abs(r) < 3 * 1.4826 * np.median(np.abs(r)) + 0.5
+    k, c = np.polyfit(at[col][keep], gap[col][keep], 1)
+    return {"tilt_deg": float(np.degrees(np.arctan(k))), "side_px": float(np.median(gap[col][keep])),
+            "top_px": float(qa.min() - ma.min()), "bot_px": float(ma.max() - qa.max()),
+            "body_px": float(ma.max() - ma.min()), "axis_deg": float(np.degrees(th))}
+
+
+# --------------------------------------------------------------------------------------------- ghost and spots
+
+def ghost_px(src, clean, out, M, levels=4.0):
+    """check_ghost.py: old garbled print (the source's top-hat 7 at 0.03) away from the new print (the clean render's
+    top-hat 15 at 0.03, dilated 3 px) where the output is brighter than the clean render by `levels`, inside the matte
+    eroded 4 px. -> px"""
+    m = binary_erosion(M, iterations=4)
+    if not m.any():
+        return 0
+    ys, xs = np.nonzero(m)
+    sl = (slice(ys.min(), ys.max() + 1), slice(xs.min(), xs.max() + 1))
+    Ls, Lc = lin_lum(src[sl]), lin_lum(clean[sl])
+    old = (Ls - grey_opening(Ls, size=(7, 7))) > 0.03
+    new = binary_dilation((Lc - grey_opening(Lc, size=(15, 15))) > 0.03, iterations=3)
+    brighter = (out[sl].astype(np.int16) - clean[sl].astype(np.int16)).mean(-1) > levels
+    return int((old & ~new & brighter & m[sl]).sum())
+
+
+def spots(src, out, changed, cfg=None):
+    """check_spots.py, calibrated: changed px darker than the source's own body round them (a 7 px grey opening of the
+    source) by spot_levels, clear of the output's print (top-hat 15 at 0.03, dilated spot_clear px: the first version
+    took a letter's dark fringe, 2 px out, for a spot), in pieces of spot_min_px to spot_max_px. The body is a
+    spot_body px opening of the source (7 px kept garbled glyphs wider than that). -> [(y, x, px)]"""
+    c = dict(LOOKS, **(cfg or {}))
+    if not changed.any():
+        return []
+    ys, xs = np.nonzero(changed)
+    y0, y1 = max(ys.min() - 8, 0), min(ys.max() + 9, changed.shape[0])
+    x0, x1 = max(xs.min() - 8, 0), min(xs.max() + 9, changed.shape[1])
+    sl = (slice(y0, y1), slice(x0, x1))
+    Lo = lin_lum(out[sl])
+    pr = binary_dilation((Lo - grey_opening(Lo, size=(15, 15))) > 0.03, iterations=int(c["spot_clear"]))
+    # the body under the source's garbled print: a 15 px opening (the composite clamps the body to a 13 px one; a 7 px
+    # opening kept a garbled glyph wider than that, a heart, and read its removal as a spot)
+    body = grey_opening(src[sl].astype(np.float32).mean(-1), size=(int(c["spot_body"]), int(c["spot_body"])))
+    dark = (body - out[sl].astype(np.float32).mean(-1) >= float(c["spot_levels"])) & changed[sl] & ~pr
+    lab, n = ndi.label(dark, np.ones((3, 3)))
+    if not n:
+        return []
+    ar = ndi.sum(dark, lab, range(1, n + 1))
+    cm = ndi.center_of_mass(dark, lab, range(1, n + 1))
+    return [(int(round(y)) + y0, int(round(x)) + x0, int(s)) for (y, x), s in zip(cm, ar)
+            if c["spot_min_px"] <= s <= c["spot_max_px"]]
+
+
+# -------------------------------------------------------------------------------------------- per-frame measures
+
+def frame_looks(src, out, M, changed, polarity="light", spot_cfg=None):
+    """The per-frame measures: print sharpness of the output and the source, the print against the limb (tilt), the
+    lines against the base (level), the base alone, spots. -> dict"""
+    r = {}
+    if not M.any():
+        return r
+    r["sharp_out"] = edge_strength(out, M)
+    r["sharp_src"] = edge_strength(src, M)
+    t = tilt_measure(out, M)
+    if t is not None:
+        r["tilt"] = t
+    try:
+        lv = lvl.measure(out, M, polarity)
+    except (ValueError, np.linalg.LinAlgError):
+        lv = None
+    if lv is not None:
+        r["level"] = lv
+        try:                                     # the frame's own print, the same way (lines)
+            lv = lvl.measure(src, M, polarity)
+        except (ValueError, np.linalg.LinAlgError):
+            lv = None
+        if lv is not None:
+            r["level_src"] = lv
+    try:
+        r["base_deg"] = lvl.base_deg(M)
+    except (ValueError, np.linalg.LinAlgError):
+        pass
+    if polarity == "light":
+        # a light-print measure: dark print's own letters are dark marks on the body it can't tell from spots (it
+        # flagged every frame of the one workflow's dark-print jar and tube, V54); stray dark print there is the
+        # double check's (review.doubled)
+        sp = spots(src, out, changed, spot_cfg)
+        if sp:
+            r["spots"] = sp
+    return r
+
+
+# --------------------------------------------------------------------------------------------------- evaluate
+
+def _runs(ts):
+    out = []
+    for t in sorted(ts):
+        if out and t == out[-1][1] + 1:
+            out[-1][1] = t
+        else:
+            out.append([t, t])
+    return out
+
+
+def evaluate(F, shots, fps=24.0, cfg=None):
+    """F {clip frame: {"looks": frame_looks(...), "swim": swim_pair(t, t + 1) or None, "ghost_px": or None}} over the
+    refined frames; shots {key: {"frames": [clip frames], "keyframe": frame, "level_target": "base" | None, "glue":
+    render.glue, "level_on": bool}}. -> ({frame: [(check, why)]}, summary {"looks": per-check numbers, "actions":
+    [{"check", "frames", "try": settings}]})"""
+    c = dict(LOOKS, **(cfg or {}))
+    flags, summ, actions = {}, {}, []
+
+    def flag(t, k, why):
+        flags.setdefault(t, []).append((k, why))
+
+    def act(k, frames, why, try_):
+        actions.append({"check": k, "frames": [[a, b + 1] for a, b in _runs(frames)], "why": why, "try": try_})
+    for key, sh in shots.items():
+        ts = sorted(t for t in sh["frames"] if t in F)
+        if not ts:
+            continue
+        kf = sh["keyframe"]
+        S = {}
+        # swim: near-still pairs; a run of excess pairs is flagged, and the pairs at a held run's ends on their own
+        sw = {t: F[t]["swim"] for t in ts if F[t].get("swim")}
+        if sw:
+            ex = {t: s["swim_px"] - s["swim_src_px"] for t, s in sw.items()}
+            bad = sorted(t for t, e in ex.items() if e > c["swim_excess"])
+            held = _runs(ts)
+            first = {t for a, b in held for t in sw if a <= t < a + c["ends_frames"]}
+            last = {t for a, b in held for t in sw if b - c["ends_frames"] <= t < b}
+            ends = first | last
+            hit = [t for t in bad if t not in ends and
+                   sum(abs(u - t) <= c["swim_window"] // 2 for u in bad if u not in ends) >= c["swim_pairs"]]
+            end_hit = [t for t in bad if t in ends]
+            for t in hit:
+                flag(t, "swim", f"the label slides {sw[t]['swim_px']:.2f} px against the product to {t + 1} "
+                                f"(the source's print {sw[t]['swim_src_px']:.2f}; the body moves "
+                                f"{np.hypot(*sw[t]['body']):.1f} px)")
+            g = sh.get("glue")
+            if hit:
+                act("swim", hit, "the label swims on near-still frames",
+                    {"render": {"glue": True}} if not g else {"render": {"glue": dict(g if isinstance(g, dict) else {},
+                                                                                      sigma=6)}})
+            for t in end_hit:
+                flag(t, "ends", f"at the run's end the label slides {sw[t]['swim_px']:.2f} px against the product to "
+                                f"{t + 1} (the source's print {sw[t]['swim_src_px']:.2f})")
+            if end_hit:
+                # flip the glue's edge at the end that swims, keep the other (one product wanted "mean" at its start,
+                # another "line" there and "mean" at its end)
+                e = list(edges(g.get("edge", "line") if isinstance(g, dict) else "line"))
+                flip = {"line": "mean", "mean": "line"}
+                if any(t in first for t in end_hit):
+                    e[0] = flip[e[0]] if g else "mean"
+                if any(t in last for t in end_hit):
+                    e[1] = flip[e[1]] if g else "mean"
+                act("ends", end_hit, "the label swims on a held run's " + " and ".join(
+                    w for w, s_ in (("first pairs", first), ("last pairs", last)) if any(t in s_ for t in end_hit)),
+                    {"render": {"glue": dict(g if isinstance(g, dict) else {}, edge=e[0] if e[0] == e[1] else e)}})
+            # creep: the label's shift against the source's print summed over each run of still pairs (V71)
+            # still: the source print's own shift on the label's box (exact there; the swim's body search let a
+            # settling bottle's 0.6-0.8 px frames in, and their motion read as creep)
+            still = [t for t in sorted(sw) if "d" in sw[t]
+                     and np.hypot(*sw[t].get("src", sw[t]["body"])) <= c["creep_still"]
+                     and max(sw[t]["fix"]) > 0
+                     and abs(sw[t]["fix"][1] - sw[t]["fix"][0]) <= c["creep_fix"] * max(sw[t]["fix"])]
+            cr, crept = [], []
+            for a, b in _runs(still):
+                if b - a + 1 < c["creep_pairs"]:
+                    continue
+                cum = np.vstack([[0.0, 0.0], np.cumsum([sw[t]["d"] for t in range(a, b + 1)], axis=0)])
+                spread = float(max(np.hypot(*(cum[i] - cum[j])) for i in range(len(cum)) for j in range(i + 1, len(cum))))
+                cr.append({"frames": [a, b + 1], "px": round(spread, 3)})
+                if spread > c["creep_px"]:
+                    crept += list(range(a, b + 2))
+                    for t in range(a, b + 2):
+                        flag(t, "creep", f"the label creeps {spread:.2f} px against the still product over {a}-{b + 1} "
+                                         f"(creep_px {c['creep_px']})")
+            if crept:
+                act("creep", crept, "the label creeps on a still product",
+                    {"render": {"glue": dict(g if isinstance(g, dict) else {}, still_px=2.0)}})
+            S["creep"] = {"runs": cr, "flagged": len(crept)}
+            # lock (V77, the edit carry): the new print against the generated print, summed over each run of measured
+            # pairs; flagged where it spreads over lock_px within lock_frames frames
+            lk_ = {t: F[t]["lock"] for t in ts if F[t].get("lock")}
+            lr, locked = [], []
+            W = int(c["lock_frames"])
+            for a, b in _runs(sorted(lk_)):
+                # each line followed from pair to pair by its centre (within lock_reach px)
+                lines = []                      # [{"at": [x, y], "cum": {t: [x, y]}}]
+                for t in range(a, b + 1):
+                    used = set()
+                    for cx, cy, dx, dy, mx, my in lk_[t]:
+                        best = None
+                        for j, L in enumerate(lines):
+                            # the same line: where the print's motion since its last pair puts it
+                            dd = np.hypot(L["at"][0] + L["mv"][0] - cx, L["at"][1] + L["mv"][1] - cy) \
+                                if L["last"] == t - 1 else np.inf
+                            if j not in used and dd <= c["lock_reach"] and (best is None or dd < best[0]):
+                                best = (dd, j)
+                        if best is None:
+                            lines.append({"at": [cx, cy], "cum": {t: [dx, dy]}, "last": t, "mv": [mx, my]})
+                            used.add(len(lines) - 1)
+                            continue
+                        L = lines[best[1]]
+                        used.add(best[1])
+                        prev = L["cum"][L["last"]]
+                        L["cum"][t] = [prev[0] + dx, prev[1] + dy] if L["last"] == t - 1 else [dx, dy]
+                        L["at"], L["last"], L["mv"] = [cx, cy], t, [mx, my]
+                worst = 0.0
+                for L in lines:
+                    tl = sorted(L["cum"])
+                    for i, t0 in enumerate(tl):
+                        seg = np.array([[0.0, 0.0]] + [L["cum"][t] for t in tl[i:] if t - t0 < W])
+                        spr = float(np.max(np.hypot(*(seg[:, None, :] - seg[None, :, :]).transpose(2, 0, 1))))
+                        worst = max(worst, spr)
+                        if spr > c["lock_px"]:
+                            locked += [t for t in tl[i:] if t - t0 < W] + [t0]
+                lr.append({"frames": [a, b + 1], "px": round(worst, 3)})
+            locked = sorted(set(locked))
+            for t in locked:
+                flag(t, "lock", f"the new print drifts against the generated print (over {c['lock_px']} px within "
+                                f"{c['lock_frames']} frames)")
+            if locked:
+                act("lock", locked, "the new print drifts against the generated print", {})
+            if lk_:
+                S["lock"] = {"runs": lr, "flagged": len(locked)}
+            v = np.array(list(ex.values()))
+            S["swim"] = {"pairs": len(sw), "median_px": round(float(np.median([s["swim_px"] for s in sw.values()])), 2),
+                         "source_median_px": round(float(np.median([s["swim_src_px"] for s in sw.values()])), 2),
+                         "excess_p90_px": round(float(np.percentile(v, 90)), 2), "flagged": len(hit),
+                         "ends_flagged": len(end_hit),
+                         "ends": {str(t): [sw[t]["swim_px"], sw[t]["swim_src_px"]] for t in sorted(ends)}}
+        # level: against the base, where the base holds steady
+        bd = [F[t]["looks"].get("base_deg") for t in ts]
+        bdv = [b for b in bd if b is not None]
+        sc = lvl.scatter(bdv)
+        lv0 = {t: F[t]["looks"]["level"] for t in ts if F[t]["looks"].get("level")}
+        lv, raw = {}, {t: m["level_deg"] for t, m in lv0.items()}
+        if lv0:
+            tl0 = sorted(lv0)
+            bm = median_filter(np.array([lv0[t]["base_deg"] for t in tl0]), 15, mode="nearest")
+            lv = {t: lv0[t]["level_deg"] for t, b in zip(tl0, bm)
+                  if abs(lv0[t]["base_deg"] - b) <= c["base_jump_deg"] and abs(lv0[t]["text_deg"]) < 5.9}
+        if sc is None or sc > c["base_mad_max"] or len(lv) < 5:
+            S["level"] = {"judged": False, "base_scatter_deg": None if sc is None else round(sc, 3)}
+        else:
+            ref = [lv[t] for t in lv if abs(t - kf) <= c["ref_window"]]
+            kfl = float(np.median(ref)) if ref else None
+            to_base = sh.get("level_target") == "base"
+            target = 0.0 if to_base else kfl
+            S["level"] = {"judged": True, "base_scatter_deg": round(sc, 3), "target": "base" if to_base else "keyframe",
+                          "keyframe_level_deg": None if kfl is None else round(kfl, 2), "frames": len(raw),
+                          "not_judged": sorted(set(raw) - set(lv))}
+            k0 = [raw[t] for t in raw if abs(t - kf) <= c["ref_window"]]
+            if k0:
+                # check_level.py's numbers: every measured frame against the keyframe frame's level
+                v0 = np.array(list(raw.values())) - float(np.median(k0))
+                S["level"]["vs_keyframe"] = {"median_deg": round(float(np.median(v0)), 2),
+                                             "median_abs_deg": round(float(np.median(np.abs(v0))), 2),
+                                             "p90_abs_deg": round(float(np.percentile(np.abs(v0), 90)), 2)}
+            if target is not None:
+                tl = sorted(lv)
+                x = median_filter(np.array([lv[t] - target for t in tl]), 5, mode="nearest")
+                run = max(2, int(math.ceil(c["level_run_s"] * fps)))
+                off = [t for t, v in zip(tl, x) if abs(v) > c["level_deg"]]
+                hit = [t for a, b in _runs(off) if b - a + 1 >= run for t in range(a, b + 1) if t in lv]
+                for t in hit:
+                    flag(t, "level", f"the label's lines run {x[tl.index(t)]:+.1f} deg against the "
+                                     f"{'base' if to_base else 'keyframe frame' + chr(39) + 's level'} "
+                                     f"(+: lower on the right)")
+                if hit:
+                    act("level", hit, "the label's lines off the base",
+                        {"render": {"level": True}} if not sh.get("level_on") else {"render": {"level": {"sigma": 2}}})
+                S["level"].update(median_deg=round(float(np.median(x)), 2), median_abs_deg=round(float(np.median(np.abs(x))), 2),
+                                  p90_abs_deg=round(float(np.percentile(np.abs(x), 90)), 2), flagged=len(hit))
+                if not to_base and kfl is not None and abs(kfl) > c["level_deg"] / 2:
+                    act("keyframe_level", [kf], f"the keyframe's own lines run {kfl:+.2f} deg against its base",
+                        {"render": {"level": {"offset": "base"}}})
+        # lines: the label's lines against the frame's own print, off their keyframe frame's difference, where the
+        # frame's print holds level with the base as on the keyframe's frame (only where level judges: a steady base)
+        ln = {t: (lv0[t]["text_deg"] - F[t]["looks"]["level_src"]["text_deg"], F[t]["looks"]["level_src"]["level_deg"],
+                  lv0[t].get("block_px", 0)) for t in lv if F[t]["looks"].get("level_src")} if S["level"]["judged"] else {}
+        k0 = [ln[t] for t in ln if abs(t - kf) <= c["ref_window"]]
+        if len(ln) >= 5 and k0:
+            d0, p0 = float(np.median([d for d, _, _ in k0])), float(np.median([p for _, p, _ in k0]))
+            tl = sorted(ln)
+            x = median_filter(np.array([ln[t][0] - d0 for t in tl]), 5, mode="nearest")
+            px = np.abs(np.tan(np.radians(x))) * np.array([ln[t][2] for t in tl])
+            judged = {t for t in tl if abs(ln[t][1] - p0) <= c["lines_print_deg"]}
+            run = max(2, int(math.ceil(c["level_run_s"] * fps)))
+            off = [t for t, v, d in zip(tl, x, px) if t in judged and abs(v) > c["lines_deg"] and d > c["lines_px"]]
+            hit = [t for a, b in _runs(off) if b - a + 1 >= run for t in range(a, b + 1) if t in judged]
+            for t in hit:
+                flag(t, "lines", f"the label's lines run {x[tl.index(t)]:+.2f} deg ({px[tl.index(t)]:.1f} px across the "
+                                 f"copy) against the frame's own print, off their difference on the keyframe's frame "
+                                 f"(+: lower on the right)")
+            if hit and not sh.get("level_on"):
+                act("lines", hit, "the label's lines turned against the frame's print", {"render": {"level": True}})
+            xj = np.array([v for t, v in zip(tl, x) if t in judged])
+            S["lines"] = {"frames": len(ln), "judged": len(judged), "keyframe_diff_deg": round(d0, 2),
+                          "median_abs_deg": round(float(np.median(np.abs(xj))), 2) if len(xj) else None,
+                          "max_abs_deg": round(float(np.abs(xj).max()), 2) if len(xj) else None,
+                          "max_px": round(float(max(d for t, d in zip(tl, px) if t in judged)), 1) if len(xj) else None,
+                          "flagged": len(hit),
+                          "not_judged": sorted(set(tl) - judged)}
+        # sharp: against the keyframe frame's own, and the source's
+        ko, ks = (F.get(kf, {}).get("looks") or {}).get("sharp_out"), (F.get(kf, {}).get("looks") or {}).get("sharp_src")
+        if ko:
+            ro = {t: F[t]["looks"]["sharp_out"] / ko for t in ts if F[t]["looks"].get("sharp_out")}
+            rs = {t: F[t]["looks"]["sharp_src"] / ks for t in ts if ks and F[t]["looks"].get("sharp_src")}
+            soft = [t for t, r in ro.items() if r < c["sharp_floor"] and r < rs.get(t, 1.0) - c["sharp_margin"]]
+            for t in soft:
+                flag(t, "sharp", f"the print is softer than the source's here: {ro[t]:.2f} of the keyframe frame's "
+                                 f"sharpness (the source {rs.get(t, float('nan')):.2f})")
+            if soft:
+                act("sharp", soft, "the print softer than the source's", {"render": {"soft_cap": 0.15,
+                                                                                     "print_alpha": {"shutter": 0}}})
+            v = np.array(list(ro.values()))
+            S["sharp"] = {"median": round(float(np.median(v)), 3), "p10": round(float(np.percentile(v, 10)), 3),
+                          "under_floor": [t for t, r in ro.items() if r < c["sharp_floor"]], "flagged": len(soft)}
+        # tilt: the print's side edge against the limb, against the keyframe's frame and its neighbours
+        tm = {t: F[t]["looks"]["tilt"] for t in ts if F[t]["looks"].get("tilt")}
+        ref = [tm[t] for t in tm if abs(t - kf) <= c["ref_window"]]
+        crisp = {t for t in tm if not ko or (F[t]["looks"].get("sharp_out") or 0) / ko >= c["sharp_floor"]}
+        if ref and len(tm) >= 5:
+            k = {q: float(np.median([m[q] for m in ref])) for q in ("tilt_deg", "side_px", "body_px")}
+            tl = sorted(tm)
+            dt = np.array([tm[t]["tilt_deg"] - k["tilt_deg"] for t in tl])
+            ds = np.array([tm[t]["side_px"] - k["side_px"] * tm[t]["body_px"] / k["body_px"] for t in tl])
+            mt, ms = median_filter(dt, 5, mode="nearest"), median_filter(ds, 5, mode="nearest")
+            run = max(2, int(math.ceil(c["tilt_run_s"] * fps)))
+            off = [t for t, a, b in zip(tl, mt, ms) if t in crisp and (abs(a) > c["tilt_deg"] or abs(b) > c["side_px"])]
+            hit = [t for a, b in _runs(off) if b - a + 1 >= run for t in range(a, b + 1) if t in tm]
+            for t in hit:
+                i = tl.index(t)
+                flag(t, "tilt", f"the print's side edge {mt[i]:+.2f} deg, {ms[i]:+.1f} px off the product's limb "
+                                f"against the keyframe's")
+            if hit:
+                act("tilt", hit, "the print turned or shifted against the limb", {"render": {"body_snap": True}})
+            S["tilt"] = {"tilt_median_abs_deg": round(float(np.median(np.abs(dt))), 2),
+                         "tilt_p90_abs_deg": round(float(np.percentile(np.abs(dt), 90)), 2),
+                         "side_median_abs_px": round(float(np.median(np.abs(ds))), 2),
+                         "side_p90_abs_px": round(float(np.percentile(np.abs(ds), 90)), 2), "flagged": len(hit)}
+        # ghost (measured in the render) and spots
+        gp = {t: F[t]["ghost_px"] for t in ts if F[t].get("ghost_px") is not None}
+        if gp:
+            gh = [t for t, v in gp.items() if v > c["ghost_px"]]
+            for t in gh:
+                flag(t, "ghost", f"the sparkle re-add brings {gp[t]} px of the old print back")
+            if gh:
+                act("ghost", gh, "the sparkle re-add brings the old print back", {"render": {"alpha": "print"}})
+            S["ghost"] = {"median_px": int(np.median(list(gp.values()))), "max_px": int(max(gp.values())),
+                          "flagged": len(gh)}
+        sp = {t: F[t]["looks"]["spots"] for t in ts if F[t]["looks"].get("spots")}
+        for t, v in sp.items():
+            flag(t, "spots", f"{len(v)} dark spot{'s' if len(v) > 1 else ''} on the label's body (at " +
+                 ", ".join(f"{x},{y}" for y, x, _ in v[:3]) + "): look")
+        S["spots"] = {"frames": len(sp), "flagged": len(sp)} if sh.get("polarity", "light") == "light" else \
+            {"judged": False, "why": f"{sh.get('polarity')} print: its letters are dark marks (the double check reads "
+                                     f"stray print)"}
+        # double: the source's own print beside the label's (V54), where the label lets the source through over print
+        db = {t: F[t]["double"] for t in ts if F[t].get("double") is not None}
+        if db:
+            tl = sorted(db)
+            med = median_filter(np.array([db[t]["px"] for t in tl], float), 5, mode="nearest")
+            hit = [t for t, v in zip(tl, med) if v >= c["double_px"]]
+            fe = sh.get("feather") if isinstance(sh.get("feather"), dict) else {}
+            names = {"bottom": "at its lower end", "top": "at its upper end", "inside": "inside it"}
+            for t in hit:
+                d = db[t]
+                be = d.get("by_end") or {}
+                where = ", ".join(f"{be[k]} px {names[k]}" for k in ("bottom", "top", "inside") if be.get(k))
+                flag(t, "double", f"the source's own print shows beside the label's: {d['px']} px ({where}; the "
+                                  f"largest piece at {d['at'][1]},{d['at'][0]})")
+            # at the label's ends (a fade or band end over a line) the band's settings help; elsewhere (the side
+            # fades: a generated layout wider than the keyframe's, the tube's packshot keyframe) look
+            at_ends = sum((db[t].get("by_end") or {}).get(k, 0) for t in hit for k in ("top", "bottom"))
+            inside = sum((db[t].get("by_end") or {}).get("inside", 0) for t in hit)
+            if hit and at_ends >= inside:
+                if sh.get("alpha", "label") == "label" and fe and fe.get("print_gap") is None:
+                    try_ = {"render": {"feather": dict(fe, print_gap=2)}}
+                else:
+                    try_ = {"anchor": {"over_print": {"room": 48}}}
+                act("double", hit, "the frame's own print shows beside the label's (its end fade or band end over a "
+                                   "line)", try_)
+            v = [d["px"] for d in db.values()]
+            S["double"] = {"frames": len(db), "median_px": int(np.median(v)), "max_px": int(max(v)), "flagged": len(hit),
+                           "px": {str(t): d["px"] for t, d in sorted(db.items()) if d["px"]}}
+        summ[str(key)] = S
+    return flags, {"looks": summ, "actions": actions}

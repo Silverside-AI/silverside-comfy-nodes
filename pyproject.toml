@@ -1,0 +1,9 @@
+[project]
+name = "silverside-comfy-nodes"
+version = "1.0.0"
+description = "Silverside's custom ComfyUI nodes for its Brand Brain workflows: video mattes and VFX passes, image grain and grade, aspect-ratio reframing, photo projection onto 3D models, product label refinement, video reframing, video extension, video trimming and scene splitting."
+license = { text = "Proprietary" }
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/Silverside-AI/silverside-comfy-nodes"

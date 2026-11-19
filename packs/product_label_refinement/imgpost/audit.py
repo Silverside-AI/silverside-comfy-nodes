@@ -1,0 +1,310 @@
+"""Automatic QA after a run: the problems a reviewer circles, measured so they can't be skipped.
+
+  covered   the product went over colour the generated product doesn't have: an occluder in front the job missed
+            (a carrier's wall over a label's corner) or an outline past the generated edge (glass, background)
+  leftover  a rim of the generated product left just outside the new matte
+  fill      fill thick enough to show as a smear
+  squeeze   (cylinder) print within a few degrees of the scene's silhouette, pressed into the edge
+  edges     an edge line still more than 1.5 px off after the fit
+  cut       (shape 'generated') real print outside the generated label's shape, cut off
+  repaint   the product's own colour moved (its body, glass, cap, finish), not only its print
+
+Each finding: {"check", "level" (FAIL | WARN | INFO), "box" [x0, y0, x1, y1] scene px, "text"}. FAIL and WARN need a
+look at qa/audit.png (before | after tiles of every finding) before delivery.
+"""
+import numpy as np
+from scipy.ndimage import binary_erosion, distance_transform_edt, find_objects, label, uniform_filter
+
+from . import qa
+
+
+def colour_model(crop_u8, mask, q=16):
+    """Share of the generated product's pixels per colour bin (q levels per channel), smoothed over neighbours."""
+    idx = (crop_u8[mask] // (256 // q)).astype(int)
+    h = np.zeros((q, q, q))
+    np.add.at(h, (idx[:, 0], idx[:, 1], idx[:, 2]), 1.0)
+    h = uniform_filter(h, size=3, mode="constant") * 27.0
+    return h / max(float(h.sum()), 1.0)
+
+
+def share(model, crop_u8, q=16):
+    i = (crop_u8 // (256 // q)).astype(int)
+    return model[i[..., 0], i[..., 1], i[..., 2]]
+
+
+def _components(mask, offset, min_px=1):
+    lab, n = label(mask)
+    out = []
+    for i, sl in enumerate(find_objects(lab), 1):
+        m = lab[sl] == i
+        a = int(m.sum())
+        if a < min_px:
+            continue
+        thick = 2.0 * float(distance_transform_edt(np.pad(m, 1))[1:-1, 1:-1].max())
+        ys, xs = sl
+        out.append({"px": a, "thick": round(thick, 1),
+                    "box": [xs.start + offset[0], ys.start + offset[1], xs.stop - 1 + offset[0], ys.stop - 1 + offset[1]]})
+    return out
+
+
+def _local_mean(img, mask, win):
+    """Mean colour of the masked pixels in a win x win window around every pixel (normalized box filter)."""
+    w = mask.astype(float)
+    num = np.stack([uniform_filter(img[..., k].astype(float) * w, win) for k in range(3)], -1)
+    den = uniform_filter(w, win)
+    return num / np.maximum(den, 1e-6)[..., None], den
+
+
+def limb_guard(H, ref_lin, inside):
+    """A cylinder's limbs checked against the packshot's label paper: if the paper bottoms out and climbs onto a flat
+    plateau before a measured limb, that "limb" is the edge of the packshot's drop shadow. -> warning lines"""
+    from .grade import flatten_columns
+    _, prof = flatten_columns(ref_lin, inside)
+    Lp = prof.mean(1)
+    out = []
+    for side, sgn in (("right", 1), ("left", -1)):
+        us = np.arange(int(H.axis_x), int(H.axis_x + sgn * (H.r - 2)), sgn)
+        us = us[(us >= 0) & (us < len(Lp))]
+        if len(us) > 20:
+            k = int(np.argmin(Lp[us]))
+            rise = float(Lp[us[k:]].max() / max(Lp[us[k]], 1e-6)) if k < len(us) - 3 else 1.0
+            if rise > 1.15 and k >= len(us) // 2 and abs(us[-1] - us[k]) > 4:   # a dip near the limb, not a lit side
+                out.append(f"limb       the packshot's label paper bottoms out at u {us[k]} and climbs {rise:.2f}x before "
+                           f"the {side} limb ({H.axis_x + sgn * H.r:.1f}): the drop shadow? Measure the limb where the "
+                           "label or glass meets the shadow, not the shadow's outer edge (pitfall 64)")
+    return out
+
+
+def print_reach(axis_x, r, refmask, ref_shape, ref_lin):
+    """How far round the bottle the packshot's print reaches, per side, in degrees from the front (cylinders). Bands
+    running across the label are not text. -> {side: deg} or None"""
+    ry, rx = np.mgrid[0:ref_shape[0], 0:ref_shape[1]].astype(float)
+    ins = (refmask.sample(rx, ry) > 0.5) & (np.abs(rx - axis_x) < r)
+    ins = binary_erosion(ins, iterations=max(2, int(0.03 * r)))              # the label's own edge isn't print
+    Lr = ref_lin @ np.array([0.2126, 0.7152, 0.0722])
+    if not ins.any():
+        return None
+    ink = ins & (Lr < 0.45 * np.percentile(Lr[ins], 90))
+    band = np.zeros(ink.shape[0], bool)                                     # unbroken runs over 12 % of the width
+    for yy in np.nonzero(ink.any(1))[0]:
+        e = np.diff(np.r_[0, ink[yy].astype(np.int8), 0])
+        band[yy] = (np.nonzero(e < 0)[0] - np.nonzero(e > 0)[0]).max() > 0.12 * max(int(ins[yy].sum()), 1)
+    ink &= ~band[:, None]
+    if ink.sum() <= 20:
+        return None
+    th = np.degrees(np.arcsin(np.clip((rx[ink] - axis_x) / r, -1, 1)))
+    return {side: float(np.percentile(np.abs(th[sel]), 99.0)) for side, sel in (("right", th > 0), ("left", th < 0))
+            if sel.any()}
+
+
+def squeeze_info(H, refmask, ref_shape, ref_lin):
+    """How far round the packshot's print reaches against the scene's silhouette, per side, in degrees (cylinders).
+    -> {side: {"print", "limb"}} or None"""
+    if not hasattr(H, "axis_x"):
+        return None
+    reach = print_reach(H.axis_x, H.r, refmask, ref_shape, ref_lin)
+    if reach is None:
+        return None
+    return {side: {"print": a, "limb": abs(float(np.degrees(H.limb_angle(side))))} for side, a in reach.items()}
+
+
+def run(crop_u8, after_u8, alpha, old, vis, F, offset, align_rep=None, squeeze=None, cut=None, ink=False, shape=False):
+    """-> (findings, audit sheet PIL image or None). squeeze: {side: {"print": deg the print reaches, "limb": deg}}.
+    cut: real print outside the visible shape (shape 'generated'), which the shape cuts off. ink: an ink matte (the
+    print lies on the product's own surface by design: no 'covered'). shape: the visible outline is the generated
+    one, so an edge the fit misses by a few px only moves a margin (INFO; 'cut' catches print cut off)."""
+    found = []
+    prod = (alpha > 0.5) & (vis > 0.5)
+    ys, xs = np.nonzero(prod)
+    if not len(ys):
+        return found, None
+    size = float(min(np.ptp(ys), np.ptp(xs)) + 1)
+    t_fail = max(3.0, 0.03 * size)                   # px of thickness that reads as a region, not an edge
+    band = max(6.0, 0.06 * size)                     # occluders and overshoot happen near the edge
+    win = int(2 * band + 1) | 1
+    d_in = distance_transform_edt(prod)              # inside the new product, px from its edge
+    d_out = distance_transform_edt(~prod)            # outside it
+    gen = binary_erosion(old & (vis > 0.99), iterations=3)
+    # local colours in the ORIGINAL frame: the generated product's interior and the background just outside the new one
+    pm, pden = _local_mean(crop_u8, gen, win)
+    bgm, bden = _local_mean(crop_u8, (d_out >= 3) & (d_out <= band + 3) & (vis > 0.5) & ~old, win)
+
+    def dist(a, m):
+        return np.abs(a.astype(float) - m).max(-1)
+
+    # covered: near the new edge, pixels whose original colour is the background's, not the product's
+    near = prod & (d_in <= band) & (pden > 0.02) & (bden > 0.02)
+    db, dp = dist(crop_u8, bgm), dist(crop_u8, pm)
+    cov = near & (db < 0.5 * dp) & (dp > 30) & (not ink)
+    # ...unless the generated product has that colour further in nearby (a printed band running out to its edge)
+    h = int(band)
+    for y, x in zip(*np.nonzero(cov)):
+        y0_, x0_ = max(y - h, 0), max(x - h, 0)
+        g = gen[y0_:y + h + 1, x0_:x + h + 1] & (d_in[y0_:y + h + 1, x0_:x + h + 1] > d_in[y, x] + 2)
+        if g.any() and dist(crop_u8[y0_:y + h + 1, x0_:x + h + 1][g], crop_u8[y, x].astype(float)).min() < 14:
+            cov[y, x] = False
+    for c in sorted(_components(cov, offset, 4), key=lambda c: -c["px"])[:6]:
+        lvl = "FAIL" if c["thick"] >= t_fail and c["px"] >= max(12, 0.004 * prod.sum()) else \
+              "WARN" if c["thick"] >= 2.5 else "INFO"
+        what = "an occluder in front the job missed, or the outline runs past the generated product" if lvl != "INFO" \
+            else f"a strip up to {c['thick']:.0f} px wide past the generated edge"
+        found.append({"check": "covered", "level": lvl, "box": c["box"],
+                      "text": f"product over {c['px']} px of the background's colour ({what})"})
+
+    # leftover: just outside the new edge, the result looks like the generated product, not the background beyond
+    ring = (d_out >= 1) & (d_out <= 3) & (vis > 0.5) & ~F
+    far_m, fden = _local_mean(after_u8, (d_out >= 6) & (d_out <= 10) & (vis > 0.5), win)
+    left = ring & (fden > 0.02) & (pden > 0.02) & (dist(after_u8, pm) < 0.5 * dist(after_u8, far_m)) & \
+        (dist(after_u8, far_m) > 30) & (np.abs(far_m - pm).max(-1) > 40)   # a rim only shows on a different background
+    for c in sorted(_components(left, offset, 6), key=lambda c: -c["px"])[:4]:
+        found.append({"check": "leftover", "level": "WARN" if c["px"] >= 12 else "INFO", "box": c["box"],
+                      "text": f"{c['px']} px just outside the new edge look like the generated product, not the "
+                              "background beyond: a rim may show"})
+
+    # fill: thick fill regions smear at small scale
+    for c in sorted(_components(F & (vis > 0.5), offset, 6), key=lambda c: -c["thick"])[:4]:
+        if c["thick"] >= max(2.5, 0.02 * size):
+            found.append({"check": "fill", "level": "WARN", "box": c["box"],
+                          "text": f"fill {c['thick']:.0f} px thick over {c['px']} px: check it doesn't smear"})
+
+    # cut: the real print reaches past the generated label's shape and is cut off there
+    if cut is not None:
+        for c in sorted(_components(cut, offset, 3), key=lambda c: -c["px"])[:4]:
+            found.append({"check": "cut", "level": "FAIL" if c["px"] >= 8 else "WARN", "box": c["box"],
+                          "text": f"{c['px']} px of the real print fall outside the generated label's shape and are cut "
+                                  "off: the print sits too near that edge (fit, residual) or the shape was measured short"})
+
+    # squeeze: print pressed into a cylinder's silhouette. The scene sees the bottle turned by (limb - 90) deg; print at
+    # angle a shows cos(a + turn) / cos(a) as wide as in the packshot (hidden past 90 deg)
+    for side, v in (squeeze or {}).items():
+        turn = 90.0 - v["limb"]
+        a = v["print"]
+        ratio = np.cos(np.radians(min(a + turn, 90.0))) / max(np.cos(np.radians(a)), 1e-6)
+        if ratio < 0.72:                              # reviewed: 0.48-0.64 read as crushed, 0.75 passed
+            found.append({"check": "squeeze", "level": "FAIL" if ratio < 0.66 else "WARN", "box": None,
+                          "text": f"print reaching {a:.0f} deg on the {side} shows {ratio:.2f}x as wide as in the "
+                                  f"packshot (silhouette at {v['limb']:.0f} deg): pressed into the edge. Set "
+                                  "cylinder.limb_min (88) and make the label's printed edge one_sided"})
+
+    # edges: residuals after the fit (after the residual correction and the bow when there are)
+    if align_rep:
+        after = {l["label"]: l["max_px"] for l in (align_rep.get("residual") or {}).get("lines_after", [])}
+        after.update({l["label"]: l["max_px"] for l in (align_rep.get("bow") or {}).get("lines_after", [])})
+        for l in align_rep.get("lines", []):
+            m = after.get(l["label"], l["max_px"])
+            if m > 1.5:
+                found.append({"check": "edges", "level": "INFO" if shape and m <= 4.0 else "WARN", "box": None,
+                              "text": f"{l['label']}: {m:.1f} px off the generated edge after the fit" +
+                                      (" (the shape is the generated outline: a margin moves, bled or cut)" if shape else "")})
+
+    if not ink and (align_rep or {}).get("model") != "cylinder":
+        found += bow_check(crop_u8, after_u8, old, offset)
+    found += repaint_check(crop_u8, after_u8, old & (vis > 0.5), offset)
+    return found, sheet(crop_u8, after_u8, found, offset)
+
+
+REPAINT_DE = 10.0         # a cell's median colour moving this far (CIELAB dE76) is the product repainted, not its print
+REPAINT_SHARE = 0.25      # FAIL when cells holding this share of the product's area moved
+
+
+def repaint_check(crop_u8, after_u8, old, offset, n_along=8, n_across=2):
+    """The product's own colour against the generated product's, cell by cell (8 along its body x 2 across): each
+    cell's median CIELAB before and after. Print is a minority of a cell's pixels, so a clean print over a garbled one
+    leaves the median where it was; a fix that repaints the product moves it. On the test edits a whole warp that
+    turned a glossy peach tube into the packshot's pink one, warps that replaced amber glass and a frosted tube's
+    finish, dark ink that painted amber glass white and a print pasted over the wrong product moved 35-93 % of the
+    product's area by more than 10; every approved fix 0-6 % (a tube's print band, 10.6 at most). -> findings"""
+    from . import bow as bw
+    from .decide import _lab
+    m = binary_erosion(old, iterations=max(2, int(0.01 * np.sqrt(old.sum()))))
+    if m.sum() < 400:
+        return []
+    c, ax, nrm = bw.body_axis(m)
+    ys, xs = np.nonzero(m)
+    P = np.c_[xs, ys].astype(float) - c
+    t, s = P @ ax, P @ nrm
+    k = np.clip(((t - t.min()) / (np.ptp(t) + 1e-6) * n_along).astype(int), 0, n_along - 1) * n_across + \
+        np.clip(((s - s.min()) / (np.ptp(s) + 1e-6) * n_across).astype(int), 0, n_across - 1)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    a = _lab(crop_u8[y0:y1, x0:x1])[ys - y0, xs - x0]
+    b = _lab(after_u8[y0:y1, x0:x1])[ys - y0, xs - x0]
+    moved, de = np.zeros(len(ys), bool), []
+    for i in np.unique(k):
+        sel = k == i
+        d = float(np.linalg.norm(np.median(b[sel], 0) - np.median(a[sel], 0)))
+        de.append(d)
+        moved[sel] = d > REPAINT_DE
+    share_ = float(moved.mean())
+    if share_ < REPAINT_SHARE:
+        return []
+    my, mx = ys[moved], xs[moved]
+    return [{"check": "repaint", "level": "FAIL",
+             "box": [int(mx.min()) + offset[0], int(my.min()) + offset[1], int(mx.max()) + offset[0],
+                     int(my.max()) + offset[1]],
+             "text": f"the product's own colour moved by more than {REPAINT_DE:g} (CIELAB) over {100 * share_:.0f} % of "
+                     f"it (up to {max(de):.0f}): the fix repaints the product (its body, glass, cap or finish), not only "
+                     "its print"}]
+
+
+def bow_check(crop_u8, after_u8, old, offset, size=19, min_px=4.0, share=0.1):
+    """The product's lines across its body against the generated product's (pitfall 101: the user on a tube's
+    keyframe, its packshot warped flat onto a tube seen from above, "the label doesn't follow the curved tube's
+    shape", which the audit had called clean). bow.long_lines in the frame and in the result over the generated
+    product's matte, paired by their place in the layout (bow.pair_lines). A pair is off when its bows differ by more
+    than max(min_px, share x the frame's). WARN when two pairs or more and half of them are off, and the median
+    difference is over that tolerance at the median bow: every line flatter (or more bowed), not one line of text's
+    letters. The tube's flat keyframe fires (4 of 4, 9 px flatter: its rules 0 against the frame's 6 and 9); its bowed one and
+    the approved jobs stay quiet. Only for a fit that draws no curve of its own (affine, homography; not a cylinder,
+    whose bow is the body's geometry and can be truer than the generator's lines: a toner label bowed 4-8 px more than
+    its garbled print, delivered as it was). Dark print on a body has its own (ink_shape). -> findings ([] when quiet)"""
+    from . import bow as bw
+    from . import images as im
+    if old.sum() < 400:
+        return []
+    c, ax, n = bw.body_axis(old)
+    hw = bw.half_widths(old, c, ax, n)
+    if len(hw) < 4:
+        return []
+    frame = {"centre": c.tolist(), "axis": ax.tolist(), "half_widths": hw}
+    gen = bw.long_lines(im.lum(im.srgb_to_lin(im.to_float(crop_u8))), old, frame, size)
+    res = bw.long_lines(im.lum(im.srgb_to_lin(im.to_float(after_u8))), old, frame, size)
+    _, pairs = bw.pair_lines(gen, res)
+    if len(pairs) < 2:
+        return []
+    d = np.array([r["b"] - g["b"] for g, r in pairs])
+    off = [abs(x) > max(min_px, share * abs(g["b"])) for x, (g, _) in zip(d, pairs)]
+    med = float(np.median(d))
+    if sum(off) < 2 or 2 * sum(off) < len(pairs) or \
+            abs(med) <= max(min_px, share * float(np.median([abs(g["b"]) for g, _ in pairs]))):
+        return []
+    ys, xs = np.nonzero(old)
+    return [{"check": "bow", "level": "WARN",
+             "box": [int(xs.min()) + offset[0], int(ys.min()) + offset[1], int(xs.max()) + offset[0],
+                     int(ys.max()) + offset[1]],
+             "bow_px": [[round(g["b"], 1), round(r["b"], 1)] for g, r in pairs],
+             "text": f"{sum(off)} of {len(pairs)} lines across the product curve unlike the generated product's: "
+                     f"{'flatter' if med < 0 else 'more bowed'} by {abs(med):.0f} px (median; bow px, frame/result: " +
+                     ", ".join(f"{g['b']:+.0f}/{r['b']:+.0f}" for g, r in pairs) + "): the body's curve missing? "
+                     "(align.bow; Auto Draft bow print)"}]
+
+
+def sheet(before_u8, after_u8, found, offset, tile=220):
+    tiles = []
+    h, w = before_u8.shape[:2]
+    for f in found:
+        if not f.get("box"):
+            continue
+        x0, y0, x1, y1 = (f["box"][0] - offset[0], f["box"][1] - offset[1], f["box"][2] - offset[0], f["box"][3] - offset[1])
+        half = int(max(x1 - x0, y1 - y0) / 2 + 10)
+        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+        a, b = max(cx - half, 0), max(cy - half, 0)
+        c, d = min(cx + half + 1, w), min(cy + half + 1, h)
+        pair = []
+        for arr in (before_u8, after_u8):
+            im = qa.Image.fromarray(np.ascontiguousarray(arr[b:d, a:c]))
+            s = tile / max(im.width, im.height)
+            pair.append(im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))),
+                                  qa.Image.NEAREST if s >= 3 else qa.Image.LANCZOS))
+        tiles.append(qa.labelled(qa.side_by_side(pair, gap=4), f"{f['level']} {f['check']} at x {f['box'][0]}, y {f['box'][1]}",
+                                 h=22, size=14))
+    return qa.montage(tiles, max_w=1400) if tiles else None

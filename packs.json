@@ -1,0 +1,50 @@
+{
+ "automatte": {
+  "from": "nastyakolykhan-sudo/ComfyUI-AutoMatte",
+  "commit": "c2da6d0",
+  "note": "only the nodes in automatte_allowlist.json are registered",
+  "web": []
+ },
+ "image_finish": {
+  "from": "nastyakolykhan-sudo/ComfyUI-ImageFinish",
+  "commit": "9ca928f",
+  "web": []
+ },
+ "mask_aspect_crop": {
+  "from": "nastyakolykhan-sudo/ComfyUI-MaskAspectCrop",
+  "commit": "1752d49",
+  "web": [
+   "image_reframe.js"
+  ]
+ },
+ "photo_projection_3d": {
+  "from": "nastyakolykhan-sudo/ComfyUI-PhotoProjection3D",
+  "commit": "bb3e8c2",
+  "web": []
+ },
+ "product_label_refinement": {
+  "from": "nastyakolykhan-sudo/ComfyUI-ProductLabelRefinement",
+  "commit": "93b7fed",
+  "web": [
+   "image_post.js",
+   "quad_picker.js"
+  ]
+ },
+ "video_extend": {
+  "from": "nastyakolykhan-sudo/ComfyUI-VideoExtend",
+  "commit": "cd50cb2",
+  "web": []
+ },
+ "video_reframe": {
+  "from": "nastyakolykhan-sudo/ComfyUI-VideoReframe",
+  "commit": "9db0438",
+  "web": []
+ },
+ "video_trimmer": {
+  "from": "nastyakolykhan-sudo/ComfyUI-VideoTrimmer",
+  "commit": "1c80a6f",
+  "web": [
+   "video_trimmer.js"
+  ]
+ }
+}

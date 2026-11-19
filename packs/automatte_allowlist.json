@@ -1,0 +1,12 @@
+[
+ "AutoMatteCombine",
+ "AutoMatteCountPromptItems",
+ "AutoMatteDepthPasses",
+ "AutoMatteEdges",
+ "AutoMatteFit",
+ "AutoMatteImageOrVideo",
+ "AutoMatteMarigoldPasses",
+ "AutoMatteRestore",
+ "AutoMatteSaveReport",
+ "AutoMatteToRGBA"
+]
