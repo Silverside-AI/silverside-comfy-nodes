@@ -32,7 +32,7 @@
  },
  "video_extend": {
   "from": "nastyakolykhan-sudo/ComfyUI-VideoExtend",
-  "commit": "cd50cb2",
+  "commit": "32a686c",
   "web": []
  },
  "video_reframe": {
