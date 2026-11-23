@@ -24,7 +24,7 @@
  },
  "product_label_refinement": {
   "from": "nastyakolykhan-sudo/ComfyUI-ProductLabelRefinement",
-  "commit": "65cd2f8",
+  "commit": "f9f865b",
   "web": [
    "image_post.js",
    "quad_picker.js"
