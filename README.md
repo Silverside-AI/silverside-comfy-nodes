@@ -1,6 +1,6 @@
 # Silverside Comfy Nodes
 
-Silverside's custom ComfyUI nodes, as one pack (81 nodes). This repository is public so ComfyUI builds can install
+Silverside's custom ComfyUI nodes, as one pack (82 nodes). This repository is public so ComfyUI builds can install
 it from git. It holds node code only: no workflows, examples, manuals or test harnesses. Those stay private.
 
 | Part (`packs/`) | Nodes | From |
@@ -10,7 +10,7 @@ it from git. It holds node code only: no workflows, examples, manuals or test ha
 | `mask_aspect_crop` | 4: image reframe and composite, crop by mask to aspect, optional image | ComfyUI-MaskAspectCrop @ 1752d49 |
 | `photo_projection_3d` | 2: project a photo onto a 3D model, extra views | ComfyUI-PhotoProjection3D @ bb3e8c2 |
 | `product_label_refinement` | 37: label refinement, stills and video | ComfyUI-ProductLabelRefinement @ 93b7fed |
-| `video_extend` | 8: edge frames, segments and images (optional 16:9 / 9:16 padding), join (speed matching), seam repair, auto resolution, edge motion | ComfyUI-VideoExtend @ a3ad8af |
+| `video_extend` | 9: edge frames, segments and images (optional 16:9 / 9:16 padding), join (speed matching), seam repair, auto resolution, edge motion, opening guide | ComfyUI-VideoExtend @ b4baba7 |
 | `video_reframe` | 7: crop to ratio, outpaint canvas, paste back (video and image), retime | ComfyUI-VideoReframe @ 9db0438 |
 | `video_trimmer` | 10: trim, scene split and join, scene gate, video info | ComfyUI-VideoTrimmer @ 1c80a6f |
 
